@@ -1,0 +1,36 @@
+# FIX VARIABLE NAMES - PowerShell cannot handle dashes in variables
+$APP_CLIENT_ID = $env:APP_REGISTRATION_CLIENT_ID
+$KV_NAME = $env:akv_name
+
+Write-Host "Fetching Object ID for App Registration: $APP_CLIENT_ID"
+
+# First try to find the Service Principal
+$OBJECT_ID = az ad sp show --id $APP_CLIENT_ID --query id -o tsv 2>$null
+
+if (-not $OBJECT_ID) {
+    Write-Host "Service Principal not found. Creating SP for App ID $APP_CLIENT_ID ..."
+    
+    # Create the SP
+    az ad sp create --id $APP_CLIENT_ID
+
+    Write-Host "Waiting for AAD to replicate..."
+    Start-Sleep -Seconds 10
+
+    # Try again to fetch the SP Object ID
+    $OBJECT_ID = az ad sp show --id $APP_CLIENT_ID --query id -o tsv 2>$null
+}
+
+if (-not $OBJECT_ID) {
+    Write-Host "ERROR: Failed to create Service Principal for App ID $APP_CLIENT_ID"
+    exit 1
+}
+
+Write-Host "SP Object ID found: $OBJECT_ID"
+Write-Host "Assigning KV Access Policy..."
+
+az keyvault set-policy `
+  --name $KV_NAME `
+  --object-id $OBJECT_ID `
+  --secret-permissions get list set
+
+Write-Host "Access Policies Successfully Assigned!"

@@ -1,0 +1,143 @@
+$ErrorActionPreference = "Stop"
+
+# -------------------------
+# Load environment variables
+# -------------------------
+$analyticsCoreRG      = $env:deployment_rg
+$blobStorageAccount   = $env:adls_name
+$akvInstance          = $env:akv_name
+
+$APP_CLIENT_ID        = $env:APP_REGISTRATION_CLIENT_ID
+$APP_CLIENT_SECRET    = $env:APP_REGISTRATION_CLIENT_SECRET
+$TENANT_ID            = $env:TENANT_ID
+
+# -------------------------
+# Validate required values
+# -------------------------
+if ([string]::IsNullOrWhiteSpace($analyticsCoreRG))     { throw "RING3_RESOURCE_GROUP not set" }
+if ([string]::IsNullOrWhiteSpace($blobStorageAccount))  { throw "RING3_ADLS_STORAGE_ACCOUNT not set" }
+if ([string]::IsNullOrWhiteSpace($akvInstance))         { throw "RING3_KEYVAULT_NAME not set" }
+if ([string]::IsNullOrWhiteSpace($APP_CLIENT_ID))       { throw "RING3_APP_REGISTRATION_CLIENT_ID not set" }
+if ([string]::IsNullOrWhiteSpace($APP_CLIENT_SECRET))   { throw "RING3_APP_REGISTRATION_CLIENT_SECRET not set" }
+if ([string]::IsNullOrWhiteSpace($TENANT_ID))           { throw "RING3_TENANT_ID not set" }
+
+Write-Host "All required variables are set."
+# -------------------------
+# Assign RBAC Role
+# -------------------------
+#Write-Host "Assigning Storage Account Contributor RBAC role..."
+
+
+$subscriptionId = az account show --query id -o tsv
+
+$storageScope = "/subscriptions/$subscriptionId/resourceGroups/$analyticsCoreRG/providers/Microsoft.Storage/storageAccounts/$blobStorageAccount"
+
+
+az role assignment create `
+    --role "Storage Account Contributor" `
+    --assignee $APP_CLIENT_ID `
+    --scope $storageScope `
+    --output none
+
+Write-Host "✔ Role assigned to $APP_CLIENT_ID on storage account $blobStorageAccount"
+
+#az account clear
+
+# -------------------------
+# Login using Azure CLI
+# -------------------------
+Write-Host "Logging in with az CLI using Service Principal..."
+
+az login --service-principal `
+    --username $APP_CLIENT_ID `
+    --password $APP_CLIENT_SECRET `
+    --tenant   $TENANT_ID `
+    --output none
+
+Write-Host "✔ az CLI login successful."
+
+
+
+# -------------------------
+# Get Storage Account Key
+# -------------------------
+Write-Host "Fetching storage account key..."
+
+$storageKey = az storage account keys list `
+    --resource-group $analyticsCoreRG `
+    --account-name $blobStorageAccount `
+    --query "[0].value" `
+    -o tsv
+
+if ([string]::IsNullOrWhiteSpace($storageKey)) {
+    throw "Failed to fetch storage account keys"
+}
+
+Write-Host "✔ Storage key retrieved."
+
+# -------------------------
+# Generate SAS Token (1 year)
+# -------------------------
+Write-Host "Generating SAS token (valid for 1 year)..."
+
+$start  = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString("yyyy-MM-ddTHH:mm:ss'Z'")
+$expiry = (Get-Date).ToUniversalTime().AddYears(1).ToString("yyyy-MM-ddTHH:mm:ss'Z'")
+
+
+Write-Host "SAS token expiry: $expiry"
+
+$sasToken = az storage account generate-sas --services bfqt --resource-types sco --permissions rwdlacupyx --start $start --expiry $expiry --account-name $blobStorageAccount --account-key $storageKey --https-only -o tsv
+$env:AZURE_STORAGE_SAS_TOKEN = $sasToken
+if ([string]::IsNullOrWhiteSpace($sasToken)) {
+    throw "Failed to generate SAS token"
+}
+
+Write-Host "✔ SAS token generated."
+Write-Host $sasToken
+
+# -------------------------
+# Store SAS Token in Key Vault with expiry
+# -------------------------
+Write-Host "Storing SAS token in Key Vault '$akvInstance'..."
+
+$spSecret = ConvertTo-SecureString $APP_CLIENT_SECRET -AsPlainText -Force
+$spCred   = New-Object System.Management.Automation.PSCredential($APP_CLIENT_ID, $spSecret)
+
+$secretExpiry = (Get-Date).ToUniversalTime().AddYears(1).ToString("yyyy-MM-ddTHH:mm:ss'Z'")
+$secure = ConvertTo-SecureString -String $sasToken -AsPlainText -Force
+
+
+Connect-AzAccount -ServicePrincipal `
+  -Tenant $TENANT_ID `
+  -Credential $spCred `
+  -Subscription $subscriptionId | Out-Null
+
+Set-AzKeyVaultSecret -VaultName $akvInstance `
+                     -Name "SASTOKEN-DE" `
+                     -SecretValue $secure `
+                     -Expires (Get-Date $secretExpiry)
+
+
+Write-Host "✔ SAS token successfully stored in Key Vault with expiry $secretExpiry!"
+
+Write-Host "Reading SAS token from Key Vault with expiry $secretExpiry!"
+
+
+# Read the SAS token value from Key Vault
+$secret = az keyvault secret show `
+  --vault-name $akvInstance `
+  --name "SASTOKEN-DE" `
+  --query value -o tsv
+
+if ([string]::IsNullOrWhiteSpace($secret)) { throw "Key Vault secret is empty." }
+
+Write-Host "Connecting to the storage using the SAS "
+
+az storage container list `
+  --account-name $blobStorageAccount `
+  -o table
+
+
+
+
+
